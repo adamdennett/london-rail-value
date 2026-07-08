@@ -1,0 +1,23 @@
+# Raw industry data feeds - large (some > GitHub's 100 MB limit) and
+# redistributed under Rail Data Marketplace terms; download instructions in README
+RJFAF851/
+RJFAF851.ZIP
+timetable/
+cache/
+May18 Published Archive CIF*.gz
+Dec2024-Jun2025-Working-timetable/
+Dec2024-Jun2025-Working-timetable.zip
+*.cif
+*.CIF
+
+# RDG/ATOC spec document (marked Commercial in Confidence)
+SP0035.pdf
+
+# R session files
+.Rhistory
+.RData
+.Rproj.user/
+
+# Quarto working dirs
+/.quarto/
+london-rail-value_files/

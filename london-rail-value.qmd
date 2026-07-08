@@ -1,0 +1,883 @@
+---
+title: "The price of getting into London"
+subtitle: "Rail fares to the capital, weighed against the distance and time it takes to get there"
+author: "Adam Dennett"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    fig-width: 9
+    fig-height: 6
+execute:
+  warning: false
+  message: false
+params:
+  feed_dir: "E:/rail/RJFAF851"      # folder containing an RJFAFxxx fares feed
+  stations_csv: "E:/rail/UK stations.csv"
+  min_km: 15                        # exclude the TfL-zone fringe from rankings
+  vot_per_hour: 13.10               # DfT TAG value of commuting time, £/hr (~2018)
+  commuting_days: 230               # working days assumed for an annual season
+---
+
+## What this document does
+
+This analysis builds a **station-level data panel of walk-up rail fares into
+London** from the Rail Delivery Group (RDG/ATOC) national fares feed, joins it
+to station coordinates, and asks: *relative to how far away a station is — and
+roughly how long the train takes — where is it cheap or expensive to commute
+from?*
+
+The motivating observations:
+
+* **Brighton → London** is priced differently by route: the "any permitted"
+  fare (Victoria via the old Southern main line) costs more than the
+  Thameslink-only fare into London Bridge / Blackfriars, for a journey of
+  similar length.
+* **Brighton vs Leicester**: both are roughly an hour from a central London
+  terminal, yet the annual season from Leicester to St Pancras costs about
+  twice the Brighton one.
+
+### Data sources
+
+| Source | What it provides | Refresh route |
+|---|---|---|
+| `RJFAF851` fares feed (this copy generated **25/05/2018**) | Every priced flow, fare and ticket type in GB | Rail Data Marketplace → [**Fares** data product](https://raildata.org.uk/dataProducts) (published by Rail Delivery Group). Download the latest `RJFAFxxx.ZIP`, unzip, and point `params$feed_dir` at it — the fixed-width format (spec `SP0035` / RSPS5045) is unchanged. |
+| `UK stations.csv` | Station names, lat/long, CRS (TLC) and NLC codes | Rail Data Marketplace station/location products, or the ORR estimates of station usage file |
+| `timetable/May18 Published Archive CIF.gz` | Fastest direct AM-peak journey time to each London terminal (via `R/build_journey_times.R`) | Rail Data Marketplace → **NWR Historical Timetable Data** (May 2018 file matches this fares feed; May/Dec editions 2016–2025 available) or the RDG **Timetable – Full Refresh** products for current data |
+| `SP0035.pdf` | The record layout specification used for the parsers below | — |
+
+**Fares shown are from May 2018.** Relative differences between flows are
+remarkably persistent over time (regulated fares all move by the same cap),
+so the *value* conclusions are more durable than the price levels. To bring
+the whole panel up to date, drop in a current feed from the Marketplace.
+
+### How fares to "London" work in the feed
+
+Three things make this non-trivial, and the code below handles all of them:
+
+1. **London Terminals.** Most fares are priced to the pseudo-location
+   `1072 LONDON TERMINALS`, not to a specific terminus. Each terminal's
+   location record carries `fare_group = 1072`, which is how we find them all.
+   Some flows *are* priced to a specific terminal (e.g. Brighton → Victoria
+   `5426`, Brighton → Blackfriars `5112`) — these are what create the
+   route-level price differences.
+2. **Clusters.** Many fares are priced between *station clusters* (`.FSC`
+   file), so a station inherits fares set for any cluster it belongs to, and
+   likewise for its fare group.
+3. **Seasons.** The feed holds a 7-day season (`7DS`). Longer seasons are
+   derived by the industry formula **monthly = 3.84 × weekly-basis, annual =
+   40 × weekly-basis**, where the basis is the `PSS` (season standard) fare
+   if one exists, otherwise the `7DS` fare. (Leicester is a live example:
+   walk-up weekly `7DS` = £270.00 but the annual is 40 × `PSS` £233.00 ≈
+   £9,320 — matching the published annual season.)
+
+```{r setup}
+library(data.table)
+library(ggplot2)
+library(ggrepel)
+library(geodist)
+library(DT)
+library(leaflet)
+library(plotly)
+library(crosstalk)
+
+# interactive scatter with a station search box: wraps a ggplot built on a
+# crosstalk SharedData so plotly's selectize search can highlight stations
+searchable <- function(g, height = NULL) {
+  ggplotly(g, tooltip = "text", height = height) |>
+    highlight(on = "plotly_click", off = "plotly_doubleclick",
+              selectize = TRUE, persistent = FALSE, color = "red")
+}
+library(knitr)
+library(kableExtra)
+library(scales)
+
+feed_dir  <- params$feed_dir
+feed_stem <- file.path(feed_dir, basename(feed_dir))   # e.g. .../RJFAF851/RJFAF851
+stopifnot(file.exists(paste0(feed_stem, ".FFL")))
+
+cache_dir <- file.path(dirname(feed_dir), "cache")
+dir.create(cache_dir, showWarnings = FALSE)
+
+# cache expensive parses keyed on feed version, so re-renders are fast and a
+# new feed automatically invalidates the cache
+cached <- function(name, expr) {
+  f <- file.path(cache_dir, paste0(basename(feed_dir), "_", name, ".rds"))
+  if (file.exists(f)) return(readRDS(f))
+  x <- eval.parent(substitute(expr))
+  saveRDS(x, f)
+  x
+}
+
+ddmmyyyy <- function(s) as.IDate(s, format = "%d%m%Y")
+fmin <- function(x) if (all(is.na(x))) NA_real_ else min(x, na.rm = TRUE)
+
+# read a fixed-width feed file as raw lines, dropping /!! header comments
+read_feed <- function(ext) {
+  x <- fread(paste0(feed_stem, ".", ext), sep = NULL, header = FALSE,
+             col.names = "line", quote = "", strip.white = FALSE)
+  x[!startsWith(line, "/")]
+}
+
+# the feed's own generation date defines "today" for validity filtering
+dat_hdr <- readLines(paste0(feed_stem, ".DAT"), n = 6, warn = FALSE)
+as_of   <- as.IDate(sub(".*Generated:\\s+(\\d{2}/\\d{2}/\\d{4}).*", "\\1",
+                        grep("Generated", dat_hdr, value = TRUE)[1]),
+                    format = "%d/%m/%Y")
+current <- function(dt) dt[start <= as_of & end >= as_of]
+```
+
+Feed **`r basename(feed_dir)`**, priced as at **`r format(as_of, "%d %B %Y")`**.
+
+## Building the data panel
+
+### Locations, London terminals, clusters
+
+```{r locations}
+loc <- cached("loc", {
+  x <- read_feed("LOC")[startsWith(line, "RL")]
+  x <- x[, .(end   = ddmmyyyy(substr(line, 10, 17)),
+             start = ddmmyyyy(substr(line, 18, 25)),
+             nlc   = substr(line, 37, 40),
+             name  = trimws(substr(line, 41, 56)),
+             crs   = trimws(substr(line, 57, 59)),
+             fare_group = substr(line, 70, 73))]
+  unique(current(x), by = "nlc")
+})
+
+london_nlc <- loc[fare_group == "1072" | nlc == "1072", nlc]
+
+fsc <- cached("fsc", {
+  x <- read_feed("FSC")
+  current(x[, .(cluster = substr(line, 2, 5), member = substr(line, 6, 9),
+                end   = ddmmyyyy(substr(line, 10, 17)),
+                start = ddmmyyyy(substr(line, 18, 25)))])
+})
+
+london_clusters <- fsc[member %chin% london_nlc, unique(cluster)]
+london_codes    <- union(london_nlc, london_clusters)
+
+loc[nlc %chin% london_nlc, .(nlc, name, crs)] |>
+  kable(caption = "Locations in the London Terminals fare group (1072)") |>
+  kable_styling(full_width = FALSE)
+```
+
+### Flows and fares into London
+
+The `.FFL` file holds flow records (`RF`: origin, destination, route,
+validity) and fare records (`RT`: ticket code + price in pence). We keep every
+flow whose destination is a London code, plus **reversible** (`direction = R`)
+flows from a London code. One-directional flows *out of* London are
+deliberately excluded: contra-peak fares can be genuinely cheaper (a
+London→Brighton anytime day return was £26.20 against £41.90 towards London),
+so including them would understate commuter-direction prices.
+
+```{r flows}
+london_fares_raw <- cached("london_fares", {
+  ffl <- read_feed("FFL")
+
+  rf <- ffl[startsWith(line, "RF")]
+  rf <- current(rf[, .(orig  = substr(line, 3, 6),  dest  = substr(line, 7, 10),
+                       route = substr(line, 11, 15), direction = substr(line, 20, 20),
+                       end   = ddmmyyyy(substr(line, 21, 28)),
+                       start = ddmmyyyy(substr(line, 29, 36)),
+                       toc   = substr(line, 37, 39), flow_id = substr(line, 43, 49))])
+
+  rt <- ffl[startsWith(line, "RT")]
+  rt <- rt[, .(flow_id = substr(line, 3, 9), ticket = substr(line, 10, 12),
+               fare = as.integer(substr(line, 13, 20)),
+               restriction = substr(line, 21, 22))]
+  rm(ffl); gc(verbose = FALSE)
+
+  inbound  <- rf[dest %chin% london_codes]
+  outbound <- rf[orig %chin% london_codes & direction == "R"]
+  setnames(outbound, c("orig", "dest"), c("dest", "orig"))
+  flows <- rbind(inbound, outbound)
+
+  merge(flows, rt, by = "flow_id", allow.cartesian = TRUE)[
+    , .(orig, dest, route, toc, ticket, fare, restriction, source = "FFL")]
+})
+```
+
+### Non-derivable fare overrides
+
+The `.NFO` file supplies fares that either aren't in the flow file or override
+it (spec §6.3–6.4). We take adult, no-railcard records that are current and
+flagged usable (`composite = "Y"`), and let them **override** matching
+flow-file fares; suppressed records delete the flow-file fare.
+
+```{r nfo}
+london_fares <- cached("london_fares_nfo", {
+  nfo <- read_feed("NFO")
+  nfo <- nfo[, .(orig = substr(line, 2, 5),   dest  = substr(line, 6, 9),
+                 route = substr(line, 10, 14), railcard = substr(line, 15, 17),
+                 ticket = substr(line, 18, 20),
+                 end   = ddmmyyyy(substr(line, 22, 29)),
+                 start = ddmmyyyy(substr(line, 30, 37)),
+                 suppress = substr(line, 46, 46),
+                 fare = as.integer(substr(line, 47, 54)),
+                 composite = substr(line, 65, 65))]
+  # NFO records are directional: keep only fares priced INTO London
+  nfo <- current(nfo)[railcard == "   " & dest %chin% london_codes]
+
+  suppressed <- nfo[suppress == "Y", .(orig, dest, route, ticket)]
+  additions  <- nfo[suppress != "Y" & composite == "Y" & fare != 99999999L,
+                    .(fare = min(fare)), by = .(orig, dest, route, ticket)][
+                    , `:=`(toc = "NFO", restriction = "", source = "NFO")]
+
+  out <- london_fares_raw
+  if (nrow(suppressed))
+    out <- out[!suppressed, on = c("orig", "dest", "route", "ticket")]
+  # NFO overrides FFL on the same key
+  out <- out[!additions, on = c("orig", "dest", "route", "ticket")]
+  rbind(out, additions, fill = TRUE)
+})
+```
+
+### Ticket types, routes, and the fare categories we care about
+
+```{r tickets}
+tty <- cached("tty", {
+  x <- read_feed("TTY")
+  x <- x[, .(ticket = substr(line, 2, 4),
+             end   = ddmmyyyy(substr(line, 5, 12)),
+             start = ddmmyyyy(substr(line, 13, 20)),
+             tkt_desc = trimws(substr(line, 29, 43)),
+             class = substr(line, 44, 44), type = substr(line, 45, 45))]
+  unique(current(x), by = "ticket")
+})
+
+rte <- cached("rte", {
+  x <- read_feed("RTE")[startsWith(line, "RR")]
+  x <- x[, .(route = substr(line, 3, 7),
+             end   = ddmmyyyy(substr(line, 8, 15)),
+             start = ddmmyyyy(substr(line, 16, 23)),
+             route_desc = trimws(substr(line, 32, 47)))]
+  unique(current(x), by = "route")
+})
+
+# the standard-class walk-up ticket codes used nationally
+categories <- data.table(
+  ticket   = c("SDS","SDR","SOS","SOR","CDS","CDR","SVS","SVR","SSS","SSR","7DS","PSS"),
+  category = c("anytime_day_single","anytime_day_return",
+               "anytime_single","anytime_return",
+               "offpeak_day_single","offpeak_day_return",
+               "offpeak_single","offpeak_return",
+               "super_offpeak_single","super_offpeak_return",
+               "weekly_season","season_basis"))
+
+fares_cat <- merge(london_fares, categories, by = "ticket")
+fares_cat <- merge(fares_cat, rte[, .(route, route_desc)], by = "route", all.x = TRUE)
+```
+
+### From fare codes to stations
+
+A station can buy any fare priced against (a) its own NLC, (b) its fare
+group, or (c) any cluster containing either. We expand those memberships,
+then take the **cheapest fare per station × category**, remembering which
+route and London destination achieved it.
+
+```{r station-panel}
+stations <- loc[crs != "" & !nlc %chin% london_nlc & fare_group != "1072",
+                .(nlc, name, crs, fare_group)]
+
+# every code through which a station can inherit a fare
+memb <- rbind(
+  stations[, .(nlc, code = nlc)],
+  stations[fare_group != nlc, .(nlc, code = fare_group)],
+  merge(stations[, .(nlc, member = nlc)], fsc[, .(member, cluster)],
+        by = "member")[, .(nlc, code = cluster)],
+  merge(stations[, .(nlc, member = fare_group)], fsc[, .(member, cluster)],
+        by = "member")[, .(nlc, code = cluster)]
+) |> unique()
+
+sf_long <- merge(memb, fares_cat, by.x = "code", by.y = "orig",
+                 allow.cartesian = TRUE)
+sf_long <- merge(sf_long, loc[, .(nlc, dest_name = name)],
+                 by.x = "dest", by.y = "nlc", all.x = TRUE)
+
+# cheapest record per station x category (+ route detail retained separately)
+setorder(sf_long, fare)
+best <- sf_long[, .SD[1], by = .(nlc, category),
+                .SDcols = c("fare", "route", "route_desc", "dest", "dest_name")]
+
+panel <- dcast(best, nlc ~ category, value.var = "fare")
+num_cols <- setdiff(names(panel), "nlc")
+panel[, (num_cols) := lapply(.SD, function(x) x / 100), .SDcols = num_cols]
+
+# headline fares -------------------------------------------------------------
+# peak     = best fully-flexible return (anytime day return or anytime return)
+# off-peak = best restricted walk-up return (off-peak / super off-peak)
+panel[, peak_return    := pmin(anytime_day_return, anytime_return, na.rm = TRUE)]
+panel[, offpeak_return := pmin(offpeak_day_return, offpeak_return,
+                               super_offpeak_return, na.rm = TRUE)]
+panel[, peak_single    := pmin(anytime_day_single, anytime_single, na.rm = TRUE)]
+panel[, offpeak_single := pmin(offpeak_day_single, offpeak_single,
+                               super_offpeak_single, na.rm = TRUE)]
+# annual season: 40 x the season basis (PSS if present, else the 7-day price)
+panel[, annual_season  := 40 * fifelse(!is.na(season_basis), season_basis, weekly_season)]
+
+# which route/terminal delivers the cheapest season
+season_route <- best[category %in% c("season_basis", "weekly_season")]
+setorder(season_route, fare)
+season_route <- season_route[, .SD[1], by = nlc,
+                             .SDcols = c("route_desc", "dest_name")]
+panel <- merge(panel, season_route, by = "nlc", all.x = TRUE)
+
+panel <- merge(stations[, .(nlc, station = name, crs)], panel, by = "nlc")
+```
+
+### Geography: coordinates, distance, and (estimated) journey time
+
+```{r geography}
+uks <- fread(params$stations_csv)
+uks <- uks[, .(station_name = Station, lat = Latitude, lon = Longitude,
+               crs = TLC, nlc_csv = sprintf("%04d", as.integer(NLC)))]
+
+panel <- merge(panel, unique(uks[, .(nlc_csv, lat, lon)]),
+               by.x = "nlc", by.y = "nlc_csv", all.x = TRUE)
+crs_fill <- unique(uks[!is.na(lat)], by = "crs")
+panel[crs_fill, on = "crs",
+      c("lat", "lon") := .(fcoalesce(lat, i.lat), fcoalesce(lon, i.lon))]
+
+geo_matched <- panel[!is.na(lat), .N]
+
+# straight-line distance to Charing Cross (the traditional London datum),
+# with a 1.2 circuity factor to approximate route km
+chx <- c(lon = -0.1247, lat = 51.5073)
+panel[!is.na(lat),
+      dist_km := as.numeric(geodist(cbind(lon, lat), t(chx),
+                                    measure = "haversine")) / 1000]
+panel[, rail_km := dist_km * 1.2]
+
+# ---- journey time -----------------------------------------------------------
+# If data/journey_times.csv exists (columns: crs, minutes) it is used.
+# Otherwise we ESTIMATE time from distance: average speed rises with distance
+# (stopping services near London, intercity further out). This is a placeholder
+# to make the value analysis runnable end-to-end - see the appendix for how to
+# replace it with real timetable times from the Rail Data Marketplace.
+jt_file <- file.path(dirname(feed_dir), "data", "journey_times.csv")
+panel[, est_speed_kmh := pmin(150, 50 + 0.5 * dist_km)]
+panel[, time_min := rail_km / est_speed_kmh * 60]
+panel[, `:=`(time_source = "estimated", time_terminal = NA_character_)]
+if (file.exists(jt_file)) {
+  jt <- fread(jt_file)
+  if (!"terminal" %in% names(jt)) jt[, terminal := NA_character_]
+  panel[jt, on = "crs", `:=`(time_min = i.minutes, time_source = "timetable",
+                             time_terminal = i.terminal)]
+}
+```
+
+Coordinates matched for **`r geo_matched` of `r nrow(panel)`** stations with
+London fares. Journey times are
+**`r if (any(panel$time_source == "timetable")) "timetable-based where supplied, estimated elsewhere" else "distance-based estimates throughout"`** —
+treat time-based results as indicative until real timetable times are dropped in.
+
+### The finished panel
+
+One row per GB station: peak/off-peak walk-up fares, weekly and annual
+seasons, the route that achieves the cheapest season, distance and journey
+time. Saved alongside this document as `data/london_fare_panel.csv`.
+
+```{r panel-out}
+setorder(panel, station)
+dir.create(file.path(dirname(feed_dir), "data"), showWarnings = FALSE)
+fwrite(panel, file.path(dirname(feed_dir), "data", "london_fare_panel.csv"))
+
+panel[!is.na(annual_season) & !is.na(dist_km),
+      .(Station = station, CRS = crs,
+        `Peak rtn` = peak_return, `Off-peak rtn` = offpeak_return,
+        `Weekly` = weekly_season, `Annual` = annual_season,
+        `Via` = route_desc, `To` = dest_name,
+        `Km` = round(dist_km), `Est mins` = round(time_min))] |>
+  datatable(rownames = FALSE, filter = "top",
+            options = list(pageLength = 10, scrollX = TRUE)) |>
+  formatCurrency(c("Peak rtn", "Off-peak rtn", "Weekly", "Annual"),
+                 currency = "£", digits = 2)
+```
+
+## Analysis
+
+```{r analysis-base}
+an <- panel[!is.na(annual_season) & !is.na(dist_km) & dist_km >= params$min_km]
+an[, `:=`(annual_per_km   = annual_season / rail_km,
+          annual_per_day  = annual_season / params$commuting_days,
+          pence_per_min   = annual_season / (2 * params$commuting_days) / time_min * 100)]
+
+highlight <- c("BRIGHTON", "LEICESTER", "READING", "CAMBRIDGE", "OXFORD",
+               "WOKING", "MILTON KEYNES C", "CHELMSFORD", "SEVENOAKS",
+               "PETERBOROUGH", "SWINDON", "GRANTHAM", "COLCHESTER",
+               "TUNBRIDGE WELLS", "BASINGSTOKE", "BEDFORD", "LUTON")
+```
+
+### Fares rise with distance — but on very different lines
+
+Each point is a station's cheapest annual season against its distance from
+central London. The vertical spread at any given distance is the interesting
+part: at ~60 km the annual season ranges over thousands of pounds depending
+on which line you happen to live on.
+
+```{r scatter-distance}
+#| fig-cap: "Annual season cost vs straight-line distance from central London (stations ≥ 15 km, ≤ 200 km). Type in the search box to find and highlight a station; hover any point for detail."
+d1 <- an[dist_km <= 200]
+d1[, txt := sprintf("%s<br>£%s pa | %.0f km | %.0f min (%s)<br>cheapest via %s",
+                    station, comma(annual_season), dist_km, time_min,
+                    time_source, route_desc)]
+sd1 <- highlight_key(d1, ~station, group = "Fare vs distance — search stations")
+g1 <- ggplot(sd1, aes(dist_km, annual_season, text = txt)) +
+  geom_point(alpha = 0.45, colour = "#4472a8", size = 1.4) +
+  geom_smooth(aes(group = 1), method = "loess", se = FALSE,
+              colour = "grey35", linewidth = 0.7) +
+  scale_y_continuous(labels = label_currency(prefix = "£")) +
+  labs(x = "Straight-line distance from central London (km)",
+       y = "Annual season (cheapest route)") +
+  theme_minimal()
+searchable(g1)
+```
+
+### Cost per kilometre: the commuter-belt premium map
+
+```{r map}
+#| fig-cap: "Annual season pence-per-route-km. Blue = cheap for the distance, red = expensive."
+mp <- an[!is.na(lat) & dist_km <= 250]
+mp[, ppk_pctile := frank(annual_per_km) / .N * 100]
+pal <- colorNumeric("RdYlBu", c(0, 100), reverse = TRUE)
+leaflet(mp) |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addCircleMarkers(~lon, ~lat, radius = 5, stroke = FALSE, fillOpacity = 0.85,
+                   fillColor = ~pal(ppk_pctile),
+                   label = ~sprintf("%s — annual £%s, %.0f km, £%.2f/km",
+                                    station, comma(annual_season),
+                                    dist_km, annual_per_km / 100)) |>
+  addLegend("bottomright", pal = pal, values = ~ppk_pctile,
+            title = "£/km percentile")
+```
+
+### Which stations are priced above or below the trend?
+
+A simple model — `log(annual season) ~ log(distance)` — captures the broad
+distance gradient. The **residual** is then a clean measure of whether a
+station is expensive or cheap *for how far out it is*. (Once real journey
+times are loaded, refit against time for the sharper question.)
+
+```{r value-model}
+m <- lm(log(annual_season) ~ log(dist_km), data = an)
+an[, premium_pct := (exp(residuals(m)) - 1) * 100]
+
+bind_tbl <- function(dt, cap) {
+  dt[, .(Station = station, `Annual` = comma(annual_season, prefix = "£"),
+         `Km` = round(dist_km),
+         `Premium vs trend` = sprintf("%+.0f%%", premium_pct),
+         `Cheapest via` = route_desc)] |>
+    kable(caption = cap) |> kable_styling(full_width = FALSE)
+}
+setorder(an, premium_pct)
+bind_tbl(head(an[dist_km <= 250], 15), "Best value: cheapest for their distance")
+bind_tbl(tail(an[dist_km <= 250], 15)[order(-premium_pct)],
+         "Worst value: most expensive for their distance")
+```
+
+### Weighing money against time
+
+A season ticket buys access to London; time on the train is also a cost. Using
+a value of time of **£`r params$vot_per_hour`/hour** (DfT appraisal guidance,
+commuting), the *generalised* annual cost of commuting is:
+
+$$\text{generalised cost} = \text{annual season} + 2 \times \text{days} \times \frac{\text{minutes}}{60} \times \text{VoT}$$
+
+```{r generalised}
+#| fig-cap: "Generalised annual commuting cost (fare + time valued at £13.10/hr). Timetable journey times where available, distance-based estimates otherwise."
+an[, gen_cost := annual_season +
+     2 * params$commuting_days * (time_min / 60) * params$vot_per_hour]
+
+ggplot(an[dist_km <= 200], aes(time_min, annual_season)) +
+  geom_point(aes(colour = gen_cost), alpha = 0.7, size = 1.8) +
+  scale_colour_viridis_c(labels = label_currency(prefix = "£"),
+                         name = "Generalised\nannual cost") +
+  geom_text_repel(data = an[station %in% highlight & dist_km <= 200],
+                  aes(label = station), size = 3, max.overlaps = 20) +
+  scale_y_continuous(labels = label_currency(prefix = "£")) +
+  labs(x = "Fastest direct AM-peak journey to a London terminal (minutes)",
+       y = "Annual season") +
+  theme_minimal()
+
+setorder(an, gen_cost)
+an[dist_km <= 200][1:15,
+   .(Station = station, `Annual` = comma(annual_season, prefix = "£"),
+     `Est mins` = round(time_min),
+     `Generalised cost` = comma(round(gen_cost), prefix = "£"))] |>
+  kable(caption = "Lowest generalised annual commuting cost (≤ 200 km)") |>
+  kable_styling(full_width = FALSE)
+```
+
+## Time, distance and money together
+
+Everything below uses the **real May 2018 timetable times** — the fastest
+direct train arriving at a London terminal between 06:30 and 10:30 — so it is
+restricted to stations with a direct AM-peak service.
+
+```{r three-way-base}
+tt <- an[time_source == "timetable" & !is.na(time_min) & time_min > 0]
+tt[, speed_kmh := dist_km / (time_min / 60)]     # straight-line speed
+top_term <- tt[, .N, by = time_terminal][order(-N)][1:8, time_terminal]
+tt[, term_grp := fifelse(time_terminal %chin% top_term, time_terminal, "Other")]
+```
+
+That leaves **`r nrow(tt)`** stations. `speed_kmh` here is *straight-line*
+speed (distance as the crow flies over timetable minutes), so it understates
+track speed but is perfectly comparable between stations.
+
+### First, time: who gets fast trains?
+
+Distance buys speed: stopping services dominate close to London, intercity
+expresses further out. The diagonal guides are straight-line speeds — stations
+sitting below the 100 km/h line get genuinely quick trains for their distance.
+
+```{r time-vs-distance}
+#| fig-cap: "Fastest direct AM-peak journey time vs distance, by arrival terminal. Guide lines show straight-line average speed."
+guides_v <- data.table(v = c(50, 100, 150))
+ggplot(tt[dist_km <= 250], aes(dist_km, time_min)) +
+  geom_abline(data = guides_v, aes(slope = 60 / v, intercept = 0),
+              linetype = "dashed", colour = "grey55") +
+  annotate("text", x = c(155, 240, 240), y = c(196, 152, 90),
+           label = paste(c(50, 100, 150), "km/h"), colour = "grey40", size = 3) +
+  geom_point(aes(colour = term_grp), alpha = 0.7, size = 1.7) +
+  scale_colour_brewer(palette = "Set2", name = "Arrives at") +
+  geom_text_repel(data = tt[station %in% highlight & dist_km <= 250],
+                  aes(label = station), size = 3, max.overlaps = 20) +
+  coord_cartesian(ylim = c(0, 200)) +
+  labs(x = "Straight-line distance from central London (km)",
+       y = "Fastest direct AM-peak journey (minutes)") +
+  theme_minimal()
+```
+
+```{r speed-tables}
+sp <- tt[dist_km >= 30]
+setorder(sp, -speed_kmh)
+sp[1:10, .(Station = station, `To` = time_terminal, `Mins` = time_min,
+           `Km` = round(dist_km), `Speed km/h` = round(speed_kmh))] |>
+  kable(caption = "Fastest stations for their distance (≥ 30 km)") |>
+  kable_styling(full_width = FALSE)
+sp[.N:(.N - 9), .(Station = station, `To` = time_terminal, `Mins` = time_min,
+                  `Km` = round(dist_km), `Speed km/h` = round(speed_kmh))] |>
+  kable(caption = "Slowest stations for their distance (≥ 30 km)") |>
+  kable_styling(full_width = FALSE)
+```
+
+The same information as a map — the companion to the cost-per-km map above.
+The fast corridors (blue) radiate along the intercity main lines; the slow
+fringes (red) are the stopping-service territories, most visibly the North
+Downs belt south-east of London.
+
+```{r speed-map}
+#| fig-cap: "Straight-line speed of the fastest direct AM-peak train. Blue = fast for the distance, red = slow."
+mp2 <- tt[!is.na(lat) & dist_km <= 250]
+mp2[, sp_pctile := frank(speed_kmh) / .N * 100]
+pal2 <- colorNumeric("RdYlBu", c(0, 100))
+leaflet(mp2) |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addCircleMarkers(~lon, ~lat, radius = 5, stroke = FALSE, fillOpacity = 0.85,
+                   fillColor = ~pal2(sp_pctile),
+                   label = ~sprintf("%s — %d min to %s, %.0f km, %.0f km/h",
+                                    station, time_min, time_terminal,
+                                    dist_km, speed_kmh)) |>
+  addLegend("bottomright", pal = pal2, values = ~sp_pctile,
+            title = "Speed percentile")
+```
+
+### Does speed come at a price?
+
+If fares priced what you actually get, faster corridors would cost more per
+kilometre. Plotting the price of distance against the speed of the journey
+shows how loosely they are related — the vertical scatter at any speed is
+money left on the table by some lines and extracted by others.
+
+```{r speed-vs-price}
+#| fig-cap: "Annual season £ per straight-line km vs journey speed; colour = distance band. Searchable."
+tt[, dist_band := cut(dist_km, c(0, 50, 100, 250),
+                      labels = c("< 50 km", "50–100 km", "> 100 km"))]
+d2 <- tt[dist_km <= 250]
+d2[, txt := sprintf("%s<br>£%.2f per km | %.0f km/h<br>£%s pa | %d min to %s",
+                    station, annual_season / dist_km, speed_kmh,
+                    comma(annual_season), time_min, time_terminal)]
+sd2 <- highlight_key(d2, ~station, group = "Speed vs price — search stations")
+g2 <- ggplot(sd2, aes(speed_kmh, annual_season / dist_km, text = txt)) +
+  geom_point(aes(colour = dist_band), alpha = 0.65, size = 1.7) +
+  geom_smooth(aes(group = 1), method = "loess", se = FALSE,
+              colour = "grey30", linewidth = 0.7) +
+  scale_colour_manual(values = c("#66c2a5", "#fc8d62", "#8da0cb"),
+                      name = "Distance") +
+  scale_y_continuous(labels = label_currency(prefix = "£")) +
+  labs(x = "Straight-line speed of fastest AM-peak train (km/h)",
+       y = "Annual season per straight-line km") +
+  theme_minimal()
+searchable(g2)
+```
+
+### All three at once
+
+Two views of the same triple. The bubble chart keeps money on the y-axis —
+the question a house-hunter asks — with distance as bubble size and speed as
+colour: big pale bubbles low on the chart are far-away, fast **and** cheap.
+The 3D scatter (drag to rotate) shows the full time × distance × cost surface;
+its interesting feature is the *thickness* of the cloud — at any (time,
+distance) there can be thousands of pounds of vertical spread.
+
+```{r bubble}
+#| fig-cap: "Annual season vs journey time; bubble size = distance, colour = straight-line speed. Searchable."
+d3 <- tt[dist_km <= 250]
+d3[, txt := sprintf("%s<br>£%s pa | %d min | %.0f km | %.0f km/h",
+                    station, comma(annual_season), time_min, dist_km, speed_kmh)]
+sd3 <- highlight_key(d3, ~station, group = "Time vs cost — search stations")
+g3 <- ggplot(sd3, aes(time_min, annual_season, text = txt)) +
+  geom_point(aes(size = dist_km, colour = speed_kmh), alpha = 0.6) +
+  scale_colour_viridis_c(option = "plasma", name = "Speed (km/h)") +
+  scale_size_continuous(range = c(1, 7), name = "Distance (km)") +
+  scale_y_continuous(labels = label_currency(prefix = "£")) +
+  labs(x = "Fastest direct AM-peak journey (minutes)",
+       y = "Annual season (cheapest route)") +
+  theme_minimal()
+searchable(g3)
+```
+
+```{r threeD}
+#| fig-cap: "Interactive: journey time × distance × annual season. Colour = arrival terminal."
+plot_ly(tt[dist_km <= 250], x = ~dist_km, y = ~time_min, z = ~annual_season,
+        color = ~term_grp, colors = "Set2",
+        text = ~sprintf("%s<br>%.0f km | %d min | £%s pa<br>arrives %s via %s",
+                        station, dist_km, time_min, comma(annual_season),
+                        time_terminal, route_desc),
+        hoverinfo = "text", type = "scatter3d", mode = "markers",
+        height = 620, marker = list(size = 3.5, opacity = 0.75)) |>
+  layout(scene = list(xaxis = list(title = "Distance (km)"),
+                      yaxis = list(title = "Time (min)"),
+                      zaxis = list(title = "Annual season (£)")))
+```
+
+### The efficient frontier of commuting
+
+A station is *efficient* if nowhere is both quicker **and** cheaper. Computed
+across the whole network that frontier collapses to a couple of cheap
+inner-suburban stations — correct, but unhelpful, because for a house-hunter
+distance is itself a benefit (space, house prices). So we treat distance as
+the third objective and draw the time–money frontier **within distance
+bands**: each step line is the rational menu for people who want to live
+roughly that far from London.
+
+```{r frontier}
+#| fig-cap: "Annual season vs journey time, with the Pareto frontier drawn within each distance band. Labelled stations are undominated: in their band nothing is both faster and cheaper."
+#| fig-height: 7.5
+tt[, band := cut(dist_km, c(15, 50, 100, 175, Inf),
+                 labels = c("15–50 km", "50–100 km", "100–175 km", "175+ km"))]
+fb <- tt[order(band, time_min, annual_season)]
+fb[, keep := annual_season == cummin(annual_season), by = band]
+frontier <- fb[keep == TRUE][, .SD[1], by = .(band, annual_season)]
+ggplot(fb, aes(time_min, annual_season)) +
+  geom_point(aes(colour = band), alpha = 0.25, size = 1.3) +
+  geom_step(data = frontier, aes(colour = band), direction = "hv",
+            linewidth = 0.7) +
+  geom_point(data = frontier, aes(colour = band), size = 2.2) +
+  geom_text_repel(data = frontier, aes(label = station), size = 2.7,
+                  max.overlaps = 40) +
+  scale_colour_brewer(palette = "Dark2", name = "Distance band") +
+  scale_y_continuous(labels = label_currency(prefix = "£")) +
+  coord_cartesian(xlim = c(0, 180)) +
+  labs(x = "Fastest direct AM-peak journey (minutes)",
+       y = "Annual season (cheapest route)") +
+  theme_minimal()
+
+frontier[, .(Band = band, Station = station, `Mins` = time_min,
+             `Annual` = comma(annual_season, prefix = "£"),
+             `Km` = round(dist_km), `To` = time_terminal,
+             `Cheapest via` = route_desc)] |>
+  kable(caption = "Pareto-efficient stations, by distance band") |>
+  kable_styling(full_width = FALSE, font_size = 12)
+```
+
+### The best stations within a season-ticket budget
+
+The frontier answers "what's efficient overall"; a house-hunter usually asks
+the budget-constrained version: *given what I can spend on the season ticket,
+where do I get the fastest train?* First the leaderboards by price band, then
+the continuous version: how the fastest attainable commute falls as the
+budget rises, with the stations that set each new record.
+
+```{r budget-bands}
+#| fig-cap: "The fastest stations within each annual season price band. Colour = distance: pale, far-out stations high in a cheap band are the bargains."
+#| fig-height: 7
+tt[, price_band := cut(annual_season, c(0, 2000, 3000, 4000, 5000, 7000, Inf),
+                       labels = c("under £2k", "£2–3k", "£3–4k",
+                                  "£4–5k", "£5–7k", "over £7k"))]
+lead <- tt[order(time_min), .SD[1:8], by = price_band][!is.na(station)]
+lead[, rank := seq_len(.N), by = price_band]
+ggplot(lead, aes(time_min, 9 - rank)) +
+  geom_segment(aes(xend = 0, yend = 9 - rank), colour = "grey85") +
+  geom_point(aes(colour = dist_km), size = 3) +
+  geom_text(aes(label = sprintf("%s — %d min, %.0f km, £%s",
+                                station, time_min, dist_km,
+                                comma(annual_season))),
+            hjust = 0, nudge_x = 3, size = 2.7) +
+  scale_colour_viridis_c(name = "Distance (km)") +
+  facet_wrap(~price_band, ncol = 2) +
+  scale_x_continuous(limits = c(0, 210)) +
+  labs(x = "Fastest direct AM-peak journey (minutes)", y = NULL) +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(), panel.grid.major.y = element_blank())
+```
+
+```{r budget-curve}
+#| fig-cap: "The fastest commute money can buy: minimum attainable journey time at each season-ticket budget. Labelled stations set a new speed record as the budget rises."
+bc <- tt[order(annual_season, time_min)]
+bc[, best_time := cummin(time_min)]
+records <- bc[time_min == best_time][, .SD[1], by = time_min]
+ggplot(bc, aes(annual_season, time_min)) +
+  geom_point(alpha = 0.2, colour = "grey55", size = 1.2) +
+  geom_step(aes(y = best_time), direction = "vh", colour = "firebrick",
+            linewidth = 0.7) +
+  geom_point(data = records, aes(y = time_min), colour = "firebrick",
+             size = 2.2) +
+  geom_text_repel(data = records,
+                  aes(y = time_min,
+                      label = sprintf("%s (%d min)", station, time_min)),
+                  size = 2.8, max.overlaps = 30) +
+  scale_x_continuous(labels = label_currency(prefix = "£"),
+                     limits = c(0, 12000)) +
+  coord_cartesian(ylim = c(0, 130)) +
+  labs(x = "Annual season budget", y = "Fastest attainable journey (minutes)") +
+  theme_minimal()
+```
+
+### Price or speed? Shifting the balance
+
+Whether a cheap-but-slow or fast-but-dear station "wins" depends on how much
+an hour on the train is worth to you. Re-ranking stations by generalised
+cost — fare plus `r params$commuting_days` days of round-trip time valued at
+£λ/hour — shows the balance tipping as λ rises from zero (price is
+everything) to £50/hour (time is precious). Note this comparison is run for
+stations **at least 40 km out**: include the inner suburbs and they win at
+every λ, since they are both cheap and quick — the reason to move further out
+is housing, which is what the distance-banded frontier above captures. Out in
+the commuter belt proper, the tension is real: at λ = 0 the slow, cheap Oxted
+line dominates; by λ = £50 it has vanished in favour of the fast Thames
+Valley and East Coast corridors.
+
+```{r balance}
+#| fig-cap: "Top ten stations ≥ 40 km from London by generalised annual cost, under different values of time. £0/hr = cheapest fare wins; higher values increasingly reward speed."
+#| fig-height: 6.5
+vots <- c(0, 5, 13.10, 25, 50)
+bal <- rbindlist(lapply(vots, function(v) {
+  d <- tt[dist_km >= 40 & dist_km <= 250,
+          .(station, annual_season, time_min, dist_km)]
+  d[, gen := annual_season + 2 * params$commuting_days * (time_min / 60) * v]
+  setorder(d, gen)
+  d <- d[1:10]
+  d[, `:=`(rank = seq_len(.N),
+           vot = sprintf("λ = £%.0f/hr", v))]
+  d
+}))
+bal[, vot := factor(vot, levels = sprintf("λ = £%.0f/hr", vots))]
+ggplot(bal, aes(gen, 11 - rank)) +
+  geom_segment(aes(xend = 0, yend = 11 - rank), colour = "grey85") +
+  geom_point(aes(colour = time_min), size = 3) +
+  geom_text(aes(label = sprintf("%s — £%s | %d min",
+                                station, comma(round(gen)), time_min)),
+            hjust = 0, nudge_x = 200, size = 2.6) +
+  scale_colour_viridis_c(option = "magma", direction = -1,
+                         name = "Journey (min)") +
+  facet_wrap(~vot, ncol = 2, scales = "free_x") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.9))) +
+  labs(x = "Generalised annual cost (fare + time)", y = NULL) +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(), panel.grid.major.y = element_blank())
+```
+
+### Value for money, measured properly
+
+With real times we can ask the sharper question: given how long the train
+takes **and** how far it goes, what should the season cost? Residuals from
+`log(annual) ~ log(time) + log(distance)` give each station's premium or
+discount against the whole-network norm. (Time and distance are strongly
+correlated, so read the two elasticities jointly rather than separately.)
+
+```{r value-model-2}
+m2 <- lm(log(annual_season) ~ log(time_min) + log(dist_km), data = tt)
+tt[, premium2 := (exp(residuals(m2)) - 1) * 100]
+cf <- coef(m2)
+tbl2 <- function(dt, cap) {
+  dt[, .(Station = station, `Annual` = comma(annual_season, prefix = "£"),
+         `Mins` = time_min, `Km` = round(dist_km),
+         `Premium vs norm` = sprintf("%+.0f%%", premium2),
+         `Cheapest via` = route_desc)] |>
+    kable(caption = cap) |> kable_styling(full_width = FALSE)
+}
+setorder(tt, premium2)
+tbl2(head(tt[dist_km <= 250], 12), "Best value once time and distance are priced in")
+tbl2(tail(tt[dist_km <= 250], 12)[order(-premium2)],
+     "Worst value once time and distance are priced in")
+```
+
+The elasticities carry a striking message: season prices scale with
+**distance** (a 10% longer crow-fly distance means roughly
+**`r sprintf("%+.1f%%", 10 * cf[["log(dist_km)"]])`** on the price), while
+**journey time is barely priced at all** — conditional on distance its
+elasticity is just `r sprintf("%+.2f", cf[["log(time_min)"]])`, indistinguishable
+from "speed comes free". Fares inherit British Rail's mileage-based structure;
+the *quality* of the service — an express versus a crawl — was never
+systematically capitalised. That is exactly why fast-corridor stations
+(Leicester's 67-minute St Pancras run priced like the long journey it is by
+distance) can coexist with Brighton's similar-time, much cheaper season, and
+why the residual spread above is where the house-hunting opportunities live.
+
+### Case study: Brighton vs Leicester
+
+```{r case-study}
+cs_nlc <- stations[name %in% c("BRIGHTON", "LEICESTER"), nlc]
+cs <- sf_long[nlc %chin% cs_nlc &
+              category %in% c("anytime_day_return", "offpeak_day_return",
+                              "anytime_return", "offpeak_return",
+                              "weekly_season", "season_basis")]
+cs <- merge(cs, stations[, .(nlc, station = name)], by = "nlc")
+cs_best <- cs[, .(fare = min(fare) / 100),
+              by = .(station, category, route_desc, dest_name)]
+dcast(cs_best, station + route_desc + dest_name ~ category,
+      value.var = "fare") |>
+  kable(caption = "Every priced route to London: Brighton vs Leicester (£)") |>
+  kable_styling(font_size = 12)
+```
+
+The route-level detail shows exactly the effect you noticed: Brighton has an
+"any permitted" fare (usable to Victoria), a Victoria-specific fare, and a
+cheaper **Thameslink-only** fare into Blackfriars / City Thameslink / London
+Bridge — while Leicester has a single "any permitted" price to St Pancras
+with no cheap-route alternative, and a season basis (`PSS`) that still prices
+the annual at roughly **double** Brighton's despite a similar journey time.
+Competition between routes, not distance, is doing the work.
+
+## Caveats and next steps
+
+* **Journey times are estimated from distance** unless
+  `data/journey_times.csv` is supplied. `R/build_journey_times.R` builds that
+  file from a real timetable: download one of (a) **NWR Historical Timetable
+  Data** on the [Rail Data Marketplace](https://raildata.org.uk/dataProducts)
+  — includes the **May 2018** timetable matching this fares feed; (b) the
+  RDG **Timetable – Full Refresh** product there (current); or (c) the free
+  ATOC `ttis*.zip` from the
+  [National Rail Data Portal](https://opendata.nationalrail.co.uk) — then the
+  script converts it to GTFS with `UK2GTFS` and computes the fastest direct
+  AM-peak journey to each London terminal.
+* **Fares are May 2018.** Swap in a current `RJFAFxxx` feed from the
+  Marketplace "Fares" product; nothing else needs changing.
+* Advance (train-specific) fares, Oyster/contactless PAYG within the zones,
+  and railcard discounts are out of scope — this is walk-up, adult,
+  standard-class pricing.
+* Only fares priced *towards* London (or explicitly reversible) are used —
+  contra-peak fares out of London are often cheaper and would bias the panel.
+* Restriction codes (`.RST`) — e.g. exactly *which* trains count as off-peak —
+  are carried through but not decoded; two "off-peak" fares can have different
+  fine print.
+* The same pipeline generalises to any other city: replace the fare-group NLC
+  (`1072`) with e.g. Birmingham stations' group and re-run.
