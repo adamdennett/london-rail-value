@@ -13,6 +13,15 @@ Dec2024-Jun2025-Working-timetable.zip
 # RDG/ATOC spec document (marked Commercial in Confidence)
 SP0035.pdf
 
+# Property-level house price data (London Datastore) and ONS Postcode
+# Directory - multi-GB source data; only the derived per-station medians
+# (data/station_house_prices.csv) are committed
+hpm_la_2024/
+ONSPD_MAY_2025/
+hpm_la_2024.zip
+ONSPD_MAY_2025.zip
+UK-HPI-full-file-*.csv
+
 # R session files
 .Rhistory
 .RData
