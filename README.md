@@ -1,4 +1,12 @@
+---
+title: "The Price of Getting into London"
+description: "Rail fares into London weighed against journey time, distance and local house prices — a value-for-money analysis of every station in England & Wales, built from industry fares, timetable and Land Registry data."
+image: assets/thumb.png
+---
+
 # The price of getting into London
+
+**Live analysis: <https://adamdennett.github.io/london-rail-value/>**
 
 Station-level analysis of GB rail fares into London, weighed against the
 distance and journey time to a central London terminal: where is it cheap or
