@@ -912,23 +912,67 @@ that trade-off operating — and, more usefully, the stations that sit *below*
 the curve, where the market hasn't fully charged for the access.
 
 ```{r housing-scatter}
-#| fig-cap: "Median £/m² of homes sold within 2 km of the station (2016–18) vs generalised annual commuting cost (fare + time at £13.10/hr). Searchable."
+#| fig-cap: "Median £/m² of homes sold within 2 km of the station (2016–18) vs generalised annual commuting cost. Grey line = loess trend; dashed/dotted lines = ±1σ and ±2σ of the residuals around it. Ringed points sit beyond ±2σ. Searchable."
+# trend line and residual bands: ±1σ / ±2σ around the loess fit
+lo <- loess(ppm2_1618 ~ gen_cost, data = th)
+th[, `:=`(fit = predict(lo, gen_cost))]
+th[, resid_ppm2 := ppm2_1618 - fit]
+sd_r <- sd(th$resid_ppm2)
+th[, z := resid_ppm2 / sd_r]
+
+band <- data.table(gen_cost = seq(min(th$gen_cost), max(th$gen_cost),
+                                  length.out = 200))
+band[, fit := predict(lo, gen_cost)]
+band <- melt(band[, .(gen_cost, `trend` = fit,
+                      `+1σ` = fit + sd_r, `-1σ` = fit - sd_r,
+                      `+2σ` = fit + 2 * sd_r, `-2σ` = fit - 2 * sd_r)],
+             id.vars = "gen_cost", variable.name = "line", value.name = "y")
+band[, lt := fifelse(line == "trend", "solid",
+                     fifelse(line %in% c("+1σ", "-1σ"), "dashed", "dotted"))]
+band_lab <- band[, .SD[which.max(gen_cost)], by = line]
+
 th[, txt := sprintf(paste0("%s<br>£%s/m² (median %s sales)<br>£%s season | ",
-                           "%d min | gen. £%s pa"),
+                           "%d min | gen. £%s pa<br>vs trend: %+.0f £/m² (%+.1fσ)"),
                     station, comma(round(ppm2_1618)), comma(n_1618),
-                    comma(annual_season), time_min, comma(round(gen_cost)))]
+                    comma(annual_season), time_min, comma(round(gen_cost)),
+                    resid_ppm2, z)]
 sdh <- highlight_key(th, ~station, group = "Housing vs commute — search stations")
 gh <- ggplot(sdh, aes(gen_cost, ppm2_1618, text = txt)) +
+  geom_line(data = band, aes(gen_cost, y, group = line, linetype = lt),
+            colour = "grey35", linewidth = 0.5, inherit.aes = FALSE) +
+  scale_linetype_identity() +
+  geom_text(data = band_lab, aes(gen_cost, y, label = line),
+            inherit.aes = FALSE, hjust = 0, nudge_x = 150,
+            size = 3, colour = "grey30") +
   geom_point(aes(colour = time_min), alpha = 0.7, size = 1.8) +
-  geom_smooth(aes(group = 1), method = "loess", se = FALSE,
-              colour = "grey30", linewidth = 0.7) +
+  geom_point(data = th[abs(z) > 2], aes(gen_cost, ppm2_1618),
+             inherit.aes = FALSE, shape = 1, size = 3.4,
+             colour = "firebrick", stroke = 0.8) +
   scale_colour_viridis_c(name = "Journey (min)") +
-  scale_x_continuous(labels = label_currency(prefix = "£")) +
+  scale_x_continuous(labels = label_currency(prefix = "£"),
+                     expand = expansion(mult = c(0.02, 0.08))) +
   scale_y_continuous(labels = label_currency(prefix = "£")) +
   labs(x = "Generalised annual commuting cost (fare + time)",
        y = "Median £/m², homes within 2 km (2016–18)") +
   theme_minimal()
 searchable(gh)
+```
+
+One residual standard deviation here is **£`r comma(round(sd_r))` per m²** —
+on a 90 m² home, a ±1σ move is about
+£`r comma(round(sd_r * 90 / 1000))`k. The ringed stations beyond ±2σ are the
+extremes: *above* the +2σ line, housing costs far more than London access
+explains (places sold on schools, sea or setting rather than the commute);
+*below* the −2σ line, the housing is much cheaper than its commuting cost
+predicts.
+
+```{r housing-outliers}
+out <- th[abs(z) > 2][order(-z)]
+out[, .(Station = station, `£/m²` = comma(round(ppm2_1618)),
+        `Trend £/m²` = comma(round(fit)), `σ` = sprintf("%+.1f", z),
+        `Season` = comma(annual_season, prefix = "£"), `Mins` = time_min)] |>
+  kable(caption = "Stations more than 2σ from the housing–commute trend") |>
+  kable_styling(full_width = FALSE, font_size = 12)
 ```
 
 ```{r housing-gradient}
