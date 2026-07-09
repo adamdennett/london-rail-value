@@ -74,6 +74,14 @@ Three things make this non-trivial, and the code below handles all of them:
    if one exists, otherwise the `7DS` fare. (Leicester is a live example:
    walk-up weekly `7DS` = £270.00 but the annual is 40 × `PSS` £233.00 ≈
    £9,320 — matching the published annual season.)
+4. **The zone-priced belt.** Stations on the Thameslink Bedford line
+   (Harpenden, Luton, St Albans, Flitwick…) have their walk-up London fares
+   priced not to 1072 but to zonal pseudo-destinations — `LONDON ZONES 1-6`
+   and friends — as **Travelcards** (`ADT`/`ODT`/`AM3`/`WRE` day tickets,
+   `7TS` weekly season). These are included and mapped to the matching
+   categories; note a Travelcard also covers Tube and bus in the zones, so
+   these stations get slightly *more* product for the money than
+   terminal-only fares elsewhere.
 
 ```{r setup}
 library(data.table)
@@ -149,7 +157,11 @@ loc <- cached("loc", {
   unique(current(x), by = "nlc")
 })
 
-london_nlc <- loc[fare_group == "1072" | nlc == "1072", nlc]
+# the terminals group PLUS the zonal pseudo-destinations that include zone 1
+# ("LONDON ZONES 1-x"): the Thameslink belt (Harpenden, Luton, St Albans,
+# Flitwick...) has its London fares priced to these as Travelcards, not to 1072
+london_nlc <- union(loc[fare_group == "1072" | nlc == "1072", nlc],
+                    loc[grepl("^LONDON ZONES 1", name), nlc])
 
 fsc <- cached("fsc", {
   x <- read_feed("FSC")
@@ -260,15 +272,20 @@ rte <- cached("rte", {
   unique(current(x), by = "route")
 })
 
-# the standard-class walk-up ticket codes used nationally
+# the standard-class walk-up ticket codes used nationally, plus the
+# Travelcard codes used on the zone-priced flows (ADT/ODT/AM3/WRE day
+# Travelcards, 7TS weekly Travelcard season)
 categories <- data.table(
-  ticket   = c("SDS","SDR","SOS","SOR","CDS","CDR","SVS","SVR","SSS","SSR","7DS","PSS"),
+  ticket   = c("SDS","SDR","SOS","SOR","CDS","CDR","SVS","SVR","SSS","SSR","7DS","PSS",
+               "ADT","ODT","AM3","WRE","7TS"),
   category = c("anytime_day_single","anytime_day_return",
                "anytime_single","anytime_return",
                "offpeak_day_single","offpeak_day_return",
                "offpeak_single","offpeak_return",
                "super_offpeak_single","super_offpeak_return",
-               "weekly_season","season_basis"))
+               "weekly_season","season_basis",
+               "anytime_day_return","offpeak_day_return",
+               "super_offpeak_return","super_offpeak_return","weekly_season"))
 
 fares_cat <- merge(london_fares, categories, by = "ticket")
 fares_cat <- merge(fares_cat, rte[, .(route, route_desc)], by = "route", all.x = TRUE)
@@ -1033,6 +1050,14 @@ priced Brighton's Thameslink bargain into its postcodes.
   standard-class pricing.
 * Only fares priced *towards* London (or explicitly reversible) are used —
   contra-peak fares out of London are often cheaper and would bias the panel.
+* Zone-priced stations (the Thameslink belt) are represented by their
+  **Travelcard** fares — the only walk-up products to central London the feed
+  holds for them. A Travelcard includes zonal Tube/bus travel, so these
+  stations' fares buy a little more than the terminal-only fares used
+  elsewhere; their "value" is if anything slightly understated. Stations
+  wholly *inside* the TfL zones (e.g. Mill Hill Broadway, Elstree &
+  Borehamwood) have no station-specific National Rail fare to London at all —
+  their price is the TfL zonal product — and so drop out of the panel.
 * Restriction codes (`.RST`) — e.g. exactly *which* trains count as off-peak —
   are carried through but not decoded; two "off-peak" fares can have different
   fine print.
