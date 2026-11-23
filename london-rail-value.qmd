@@ -964,12 +964,12 @@ median. Scottish stations drop out — the dataset covers England & Wales.
 
 ```{r housing-base}
 hpx <- fread(file.path(dirname(feed_dir), "data", "station_house_prices.csv"))
-th <- merge(tt, hpx, by = "crs")[n_1618 >= 50 & dist_km <= 250]
+th <- merge(tt, hpx, by = "crs")[n_1618 >= 1 & dist_km <= 250]
 ```
 
 That gives **`r nrow(th)`** stations with real journey times, London fares,
-and at least 50 nearby sales (`r th[radius_km > 2, .N]` of them using a
-widened 3–5 km catchment).
+and nearby house sales (`r th[radius_km > 2, .N]` of them using a
+widened 3–5 km catchment; `r th[n_1618 < 50, .N]` still have fewer than 50 sales and are kept, flagged as small samples).
 
 ### Do house prices already price the commute?
 
@@ -999,9 +999,10 @@ band[, lt := fifelse(line == "trend", "solid",
                      fifelse(line %in% c("+1σ", "-1σ"), "dashed", "dotted"))]
 band_lab <- band[, .SD[which.max(gen_cost)], by = line]
 
-th[, txt := sprintf(paste0("%s<br>£%s/m² (median %s sales within %d km)<br>£%s season | ",
+th[, txt := sprintf(paste0("%s<br>£%s/m² (median %s sales within %d km%s)<br>£%s season | ",
                            "%d min | gen. £%s pa<br>vs trend: %+.0f £/m² (%+.1fσ)"),
                     station, comma(round(ppm2_1618)), comma(n_1618), as.integer(radius_km),
+                    fifelse(n_1618 < 50, " — small sample", ""),
                     comma(annual_season), time_min, comma(round(gen_cost)),
                     resid_ppm2, z)]
 sdh <- highlight_key(th, ~station, group = "Housing vs commute — search stations")
