@@ -957,8 +957,10 @@ area), geocoded to postcode via the ONS Postcode Directory.
 `R/build_station_house_prices.R` computes, for every station, the **median
 price per square metre of all homes sold within 2 km**, in two windows:
 **2016–18** (consistent with the May 2018 fares and timetable used
-throughout) and 2022–24. Scottish stations drop out — the dataset covers
-England & Wales.
+throughout) and 2022–24. Where a rural station has fewer than 50 2016–18
+sales within 2 km (Eridge, Hever, Glynde…), the circle is widened a
+kilometre at a time, up to 5 km, until it has enough sales for a stable
+median. Scottish stations drop out — the dataset covers England & Wales.
 
 ```{r housing-base}
 hpx <- fread(file.path(dirname(feed_dir), "data", "station_house_prices.csv"))
@@ -966,7 +968,8 @@ th <- merge(tt, hpx, by = "crs")[n_1618 >= 50 & dist_km <= 250]
 ```
 
 That gives **`r nrow(th)`** stations with real journey times, London fares,
-and at least 50 nearby sales.
+and at least 50 nearby sales (`r th[radius_km > 2, .N]` of them using a
+widened 3–5 km catchment).
 
 ### Do house prices already price the commute?
 
@@ -977,7 +980,7 @@ that trade-off operating — and, more usefully, the stations that sit *below*
 the curve, where the market hasn't fully charged for the access.
 
 ```{r housing-scatter}
-#| fig-cap: "Median £/m² of homes sold within 2 km of the station (2016–18) vs generalised annual commuting cost. Grey line = loess trend; dashed/dotted lines = ±1σ and ±2σ of the residuals around it. Ringed points sit beyond ±2σ. Searchable."
+#| fig-cap: "Median £/m² of homes sold near the station (2016–18) vs generalised annual commuting cost. Grey line = loess trend; dashed/dotted lines = ±1σ and ±2σ of the residuals around it. Ringed points sit beyond ±2σ. Searchable."
 # trend line and residual bands: ±1σ / ±2σ around the loess fit
 lo <- loess(ppm2_1618 ~ gen_cost, data = th)
 th[, `:=`(fit = predict(lo, gen_cost))]
@@ -996,9 +999,9 @@ band[, lt := fifelse(line == "trend", "solid",
                      fifelse(line %in% c("+1σ", "-1σ"), "dashed", "dotted"))]
 band_lab <- band[, .SD[which.max(gen_cost)], by = line]
 
-th[, txt := sprintf(paste0("%s<br>£%s/m² (median %s sales)<br>£%s season | ",
+th[, txt := sprintf(paste0("%s<br>£%s/m² (median %s sales within %d km)<br>£%s season | ",
                            "%d min | gen. £%s pa<br>vs trend: %+.0f £/m² (%+.1fσ)"),
-                    station, comma(round(ppm2_1618)), comma(n_1618),
+                    station, comma(round(ppm2_1618)), comma(n_1618), as.integer(radius_km),
                     comma(annual_season), time_min, comma(round(gen_cost)),
                     resid_ppm2, z)]
 sdh <- highlight_key(th, ~station, group = "Housing vs commute — search stations")
@@ -1018,7 +1021,7 @@ gh <- ggplot(sdh, aes(gen_cost, ppm2_1618, text = txt)) +
                      expand = expansion(mult = c(0.02, 0.08))) +
   scale_y_continuous(labels = label_currency(prefix = "£")) +
   labs(x = "Generalised annual commuting cost (fare + time)",
-       y = "Median £/m², homes within 2 km (2016–18)") +
+       y = "Median £/m², homes sold nearby (2016–18)") +
   theme_minimal()
 searchable(gh)
 ```
@@ -1110,7 +1113,7 @@ ggplot(fh, aes(gen_cost, ppm2_1618)) +
   scale_x_continuous(labels = label_currency(prefix = "£")) +
   scale_y_continuous(labels = label_currency(prefix = "£")) +
   labs(x = "Generalised annual commuting cost (fare + time)",
-       y = "Median £/m², homes within 2 km (2016–18)") +
+       y = "Median £/m², homes sold nearby (2016–18)") +
   theme_minimal()
 
 hfront[, .(Station = station, `£/m²` = comma(round(ppm2_1618)),
@@ -1172,7 +1175,7 @@ priced Brighton's Thameslink bargain into its postcodes.
   fine print.
 * The same pipeline generalises to any other city: replace the fare-group NLC
   (`1072`) with e.g. Birmingham stations' group and re-run.
-* Housing figures are **medians of what actually sold within 2 km** in
+* Housing figures are **medians of what actually sold within 2 km** (3–5 km for thin rural stations) in
   2016–18 — they reflect the local dwelling mix (a flat-heavy town reads
   cheaper per m² than a detached suburb at the same underlying land value).
   The 90 m² home and 3.5% capitalisation rate in the all-in ranking are
